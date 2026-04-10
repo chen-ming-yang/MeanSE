@@ -21,6 +21,7 @@ import functools
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 from espnet2.enh.layers.ncsnpp_utils import layers, layerspp, normalization
 from espnet2.enh.encoder.stft_encoder import STFTEncoder
@@ -80,6 +81,7 @@ class NCSNpp(nn.Module):
         embedding_type="fourier",
         dropout=0.0,
         centered=True,
+        use_checkpoint=False,
         **unused_kwargs,
     ):
         super().__init__()
@@ -90,6 +92,7 @@ class NCSNpp(nn.Module):
         print("flow_type:", flow_type, flush=True)
         print("fuse_type:", fuse_type, flush=True)
         '''
+        self.use_checkpoint = use_checkpoint
         self.act = act = get_act(nonlinearity)
 
         self.nf = nf = nf
@@ -421,7 +424,10 @@ class NCSNpp(nn.Module):
         for i_level in range(self.num_resolutions):
             # Residual blocks for this resolution
             for i_block in range(self.num_res_blocks):
-                h = modules[m_idx](hs[-1], temb)
+                if self.use_checkpoint and self.training:
+                    h = grad_checkpoint(modules[m_idx], hs[-1], temb, use_reentrant=False)
+                else:
+                    h = modules[m_idx](hs[-1], temb)
                 m_idx += 1
                 # Attention layer (optional)
                 if (
@@ -437,7 +443,10 @@ class NCSNpp(nn.Module):
                     h = modules[m_idx](hs[-1])
                     m_idx += 1
                 else:
-                    h = modules[m_idx](hs[-1], temb)
+                    if self.use_checkpoint and self.training:
+                        h = grad_checkpoint(modules[m_idx], hs[-1], temb, use_reentrant=False)
+                    else:
+                        h = modules[m_idx](hs[-1], temb)
                     m_idx += 1
 
                 if self.progressive_input == "input_skip":  # Combine h with x
@@ -456,11 +465,17 @@ class NCSNpp(nn.Module):
                 hs.append(h)
 
         h = hs[-1]  # actualy equal to: h = h
-        h = modules[m_idx](h, temb)  # ResNet block
+        if self.use_checkpoint and self.training:
+            h = grad_checkpoint(modules[m_idx], h, temb, use_reentrant=False)
+        else:
+            h = modules[m_idx](h, temb)  # ResNet block
         m_idx += 1
         h = modules[m_idx](h)  # Attention block
         m_idx += 1
-        h = modules[m_idx](h, temb)  # ResNet block
+        if self.use_checkpoint and self.training:
+            h = grad_checkpoint(modules[m_idx], h, temb, use_reentrant=False)
+        else:
+            h = modules[m_idx](h, temb)  # ResNet block
         m_idx += 1
 
         pyramid = None
@@ -468,7 +483,10 @@ class NCSNpp(nn.Module):
         # Upsampling block
         for i_level in reversed(range(self.num_resolutions)):
             for i_block in range(self.num_res_blocks + 1):
-                h = modules[m_idx](torch.cat([h, hs.pop()], dim=1), temb)
+                if self.use_checkpoint and self.training:
+                    h = grad_checkpoint(modules[m_idx], torch.cat([h, hs.pop()], dim=1), temb, use_reentrant=False)
+                else:
+                    h = modules[m_idx](torch.cat([h, hs.pop()], dim=1), temb)
                 m_idx += 1
 
             # edit: from -1 to -2
@@ -509,13 +527,15 @@ class NCSNpp(nn.Module):
                     else:
                         raise ValueError(f"{self.progressive} is not a valid name")
 
-            # Upsampling Layer
             if i_level != 0:
                 if self.resblock_type == "ddpm":
                     h = modules[m_idx](h)
                     m_idx += 1
                 else:
-                    h = modules[m_idx](h, temb)  # Upspampling
+                    if self.use_checkpoint and self.training:
+                        h = grad_checkpoint(modules[m_idx], h, temb, use_reentrant=False)
+                    else:
+                        h = modules[m_idx](h, temb)  # Upspampling
                     m_idx += 1
 
         assert not hs

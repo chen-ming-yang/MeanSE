@@ -1,489 +1,429 @@
-import torch
-import glob
-import itertools
-import soundfile
-import torchaudio
-import lightning
-import os
-from collections import defaultdict
-import numpy as np
-import torchaudio
-from meanutils.generate_data_param import process_one_sample as get_simu_meta
-from meanutils.simulate_data_from_param import process_one_sample, save_audio, read_audio
-import copy
+"""
+Dataset and batching utilities for MeanSE training.
+Adapted from MeanFlowSE dataset to work with pre-prepared datasets.
+"""
+
+from __future__ import annotations
+
+import json
+import re
 import random
-from torch.utils.data import BatchSampler
-from torch.utils.data import DataLoader
-from meanse.config import Config
+from pathlib import Path
+from functools import partial
+
+from tqdm import tqdm
+
+import torch
+import torch.nn.functional as F
+import torchaudio
 import soundfile as sf
-import resampy
+import lightning
+from torch.utils.data import Dataset, Sampler, DataLoader
+from meanse.config import Config
 
 
-class SimulationConfigs:
-    snr_low_bound = -5.0
-    snr_high_bound = 20.0
-    reuse_noise = True
-    prob_wind_noise = 0.05
-    wind_noise_config = dict(
-        threshold=[0.1, 0.3],
-        ratio=[1, 20],
-        attack=[5, 100],
-        release=[5, 100],
-        sc_gain=[0.8, 1.2],
-        clipping_threshold=[0.85, 1.0],
-        clipping_chance=0.75,
-        wind_noise_snr_low_bound=-10.0,
-        wind_noise_snr_high_bound=15.0,
-    )
-    prob_reverberation = 0.5
-    reuse_rir = True
+class AudioAugment:
+    """Lightweight waveform-level augmentations applied to the noisy mixture."""
 
-    augmentations_name = [
-        'bandwidth_limitation',
-        'clipping',
-        'codec',
-        'packet_loss'
-    ]
+    def __init__(self, sample_rate: int = 16000, rir_dir: str | None = None):
+        self.sample_rate = sample_rate
+        self.rir_files: list[Path] = []
 
-    num_augmentations = {
-        0: 0.25,
-        1: 0.40,
-        2: 0.20,
-        3: 0.15,
-    }
+    def _random_gain(self, wav: torch.Tensor, low: float = 0.7, high: float = 1.0) -> torch.Tensor:
+        return wav * random.uniform(low, high)
 
-    augmentations = dict(
-        bandwidth_limitation=dict(
-            weight=1.0,
-            resample_methods='random',
-        ),
-        clipping=dict(
-            weight=1.0,
-            clipping_min_quantile=[0.0, 0.1],
-            clipping_max_quantile=[0.9, 1.0],
-        ),
-        codec=dict(
-            weight=1.0,
-            config=[
-                dict(format='mp3', encoder=None, qscale=[1, 10]),
-                dict(format='ogg', encoder=['vorbis'], qscale=[-1, 10]),
-            ]
-        ),
-        packet_loss=dict(
-            weight=1.0,
-            packet_duration_ms=20,
-            max_continuous_packet_loss=10,
-            packet_loss_rate=[0.05, 0.25],
+    def _random_speed(self, wav: torch.Tensor) -> torch.Tensor:
+        """Sox-style speed perturbation ±5 % via resampling."""
+        factor = random.uniform(0.95, 1.05)
+        orig_len = wav.shape[-1]
+        resampled = torchaudio.functional.resample(
+            wav,
+            orig_freq=self.sample_rate,
+            new_freq=int(self.sample_rate * factor),
         )
-    )
-
-
-def read_kv_scp(scp):
-    rtv = {}
-    with open(scp, "r") as f:
-        for line in f:
-            uid, value = line.strip().split()
-            assert uid not in rtv, (uid)
-            rtv[uid] = value
-    return rtv
-
-
-def read_source_scp(scp):
-    source_dict = defaultdict(dict)
-    source_dict_flatten = {}
-    with open(scp, "r") as f:
-        for line in f:
-            uid, fs, audio_path = line.strip().split()
-            assert uid not in source_dict[int(fs)], (uid, fs)
-            source_dict[int(fs)][uid] = audio_path
-            source_dict_flatten[uid] = audio_path
-
-    source_uids = {k: list(source_dict[k].keys()) for k in source_dict}
-
-    return source_dict, source_uids, source_dict_flatten
-
-
-def resample_to_fix_fs(speech, noisy_speech, fs, speech_length, fix_fs):
-
-    if fix_fs is None or fix_fs <= 0:
-        return speech, noisy_speech, fs, speech_length
-    else:
-        speech = resampy.resample(speech, fs, fix_fs)
-        noisy_speech = resampy.resample(noisy_speech, fs, fix_fs)
-        fs = fix_fs
-        speech_length = speech.shape[-1]
-        return speech, noisy_speech, fs, speech_length
-    return speech, noisy_speech, fs, speech_length
-
-
-class PreSimulatedDataset(torch.utils.data.Dataset):
-    def __init__(self, clean_speech, noisy_speech, utt2fs, speech_length, max_duration=-1, fix_data_fs=0):
-
-        self.clean_speech = read_kv_scp(clean_speech)
-        self.noisy_speech = read_kv_scp(noisy_speech)
-        self.utt2fs = {k: int(v) for k, v in read_kv_scp(utt2fs).items()}
-        self.speech_length = {k: int(v)
-                              for k, v in read_kv_scp(speech_length).items()}
-
-        self.uid = list(self.clean_speech.keys())
-        self.max_duration = max_duration
-        self.fix_data_fs = fix_data_fs
-
-        assert len(self.clean_speech) == len(self.noisy_speech)
-        assert len(self.clean_speech) == len(self.utt2fs)
-        assert len(self.clean_speech) == len(self.speech_length)
-
-    def get_source_length(self):
-        if self.max_duration > 0:
-            return [min(self.speech_length[k], self.max_duration) for k in self.uid]   
+        if resampled.shape[-1] > orig_len:
+            resampled = resampled[..., :orig_len]
         else:
-            return [self.speech_length[k] for k in self.uid]
+            resampled = F.pad(resampled, (0, orig_len - resampled.shape[-1]))
+        return resampled
 
-    def get_srs(self):
-        return [self.utt2fs[k] for k in self.uid]
-
-    def __len__(self):
-
-        return len(self.clean_speech)
-
-    def __getitem__(self, index):
-
-        uid = self.uid[index]
-        audio, fs = read_audio(self.clean_speech[uid])
-        
-        if self.fix_data_fs is not None and self.fix_data_fs > 0:
-            audio = resampy.resample(audio, fs, self.fix_data_fs)
-            fs = self.fix_data_fs
-        else:
-            assert fs == self.utt2fs[uid], f"{fs}, {self.utt2fs[uid]}"
-
-        noisy, fs = read_audio(self.noisy_speech[uid])
-        
-        if self.fix_data_fs is not None and self.fix_data_fs > 0:
-            noisy = resampy.resample(noisy, fs, self.fix_data_fs)
-            fs = self.fix_data_fs
-        else:
-            assert fs == self.utt2fs[uid], f"{fs}, {self.utt2fs[uid]}"
-
-        if self.max_duration > 0 and audio.shape[1] > self.max_duration and noisy.shape[1] > self.max_duration:
-            start = random.randint(0, min(audio.shape[1], noisy.shape[1]) - self.max_duration)
-            audio = audio[:, start:start + self.max_duration]
-            noisy = noisy[:, start:start + self.max_duration]
-
-        speech_length = audio.shape[1]
-
-        return audio, noisy, fs, speech_length
+    def __call__(self, noisy: torch.Tensor) -> torch.Tensor:
+        if random.random() < 0.5:
+            noisy = self._random_gain(noisy)
+        return noisy
 
 
-class DynamicMixingDataset(torch.utils.data.Dataset):
-    def __init__(self, speech_source_scp, noise_source_scp, rir_scp, windnoise_scp, speech_length_file, use_high_pass=True, retry_when_fails=False, max_duration=240000, fix_data_fs=0):
-        super().__init__()
+class DNSDataset(Dataset):
+    """Paired clean/noisy dataset loader (paired_dir layout)."""
 
-        self.speech_source, self.speech_uids, self.speech_source_flt = read_source_scp(
-            speech_source_scp)
-        self.noise_source, self.noise_uids, self.noise_source_flt = read_source_scp(
-            noise_source_scp)
-        self.rirs, self.rir_uids, self.rirs_flt = read_source_scp(rir_scp)
-        self.wind_noises, self.wind_noises_uids, self.wind_noises_flt = read_source_scp(
-            windnoise_scp)
+    def __init__(
+        self,
+        dns_root: str,
+        sample_rate: int = 16000,
+        clip_len: float = 6.0,
+        segment_len: float | None = None,
+        use_all_segments: bool = False,
+        augment: bool = True,
+    ):
+        self.dns_root = Path(dns_root)
+        self.sample_rate = sample_rate
+        self.max_clip_samples = int(clip_len * sample_rate)
+        self.segment_samples = int(segment_len * sample_rate) if segment_len is not None else None
+        self.use_all_segments = use_all_segments and self.segment_samples is not None
+        self.augment = augment
+        self.aug = AudioAugment(sample_rate)
 
-        self.all_noise_flt = copy.deepcopy(self.noise_source_flt)
-        self.all_noise_flt.update(self.wind_noises_flt)
-
-        self.source_length = {k: min(int(v), max_duration)
-                              for k, v in read_kv_scp(speech_length_file).items()}
-
-        self.max_duration = max_duration
-
-        self.length = sum([len(self.speech_source[k])
-                          for k in self.speech_source])
-
-        self.samplerates = list(self.speech_source.keys())
-        self.fs_sub_lengths = [len(self.speech_source[k])
-                               for k in self.samplerates]
-        self.accum_lengths = [sum(self.fs_sub_lengths[0:i+1])
-                              for i in range(len(self.fs_sub_lengths))]
-
-        self.augmentations = list(SimulationConfigs.augmentations.keys())
-        weight_augmentations = np.array(
-            [v["weight"] for v in SimulationConfigs.augmentations.values()])
-        self.weight_augmentations = weight_augmentations / \
-            np.sum(weight_augmentations)
-        self.use_high_pass = use_high_pass
-        self.retry_when_fails = retry_when_fails
-        self.fix_data_fs = fix_data_fs
-        self.continuous_fail = 0
-
-    def get_srs(self,):
-
-        srs = []
-        for i in range(len(self)):
-            srs.append(self._get_from_index(i)[0])
-        return srs
-
-    def get_source_length(self,):
-
-        length = []
-        for i in range(len(self)):
-            fs, real_idx = self._get_from_index(i)
-            uid = self.speech_uids[fs][real_idx]
-            length.append(self.source_length[uid])
-
-        return length
-
-    def __len__(self):
-
-        return self.length
-
-    def simulation(self, ):
-        pass
-
-    def _get_from_index(self, index):
-
-        real_idx = -1
-        speech_fs = -1
-        previous = 0
-
-        for i, fs in enumerate(self.samplerates):
-            if index >= previous and index < self.accum_lengths[i]:
-                speech_fs = fs
-                real_idx = index - previous
-                break
-            previous = self.accum_lengths[i]
-
-        assert real_idx >= 0 and speech_fs > 0
-
-        return speech_fs, real_idx
-
-    def run_simulation(self, speech_uid, speech_length, sr):
-
-        use_wind_noise = np.random.random() < SimulationConfigs.prob_wind_noise
-        num_aug = np.random.choice(
-            list(SimulationConfigs.num_augmentations.keys()),
-            p=list(SimulationConfigs.num_augmentations.values()),
-        )
-
-        if num_aug == 0:
-            aug = "none"
-        else:
-            aug = np.random.choice(
-                self.augmentations,
-                p=self.weight_augmentations,
-                size=num_aug,
-                replace=False,
+        if not self.dns_root.is_dir():
+            raise FileNotFoundError(
+                f"dns_root does not exist: {self.dns_root.resolve()}"
             )
-            # As wind-noise simulation include clipping,
-            # we exclude clipping from augmentation list
-            while use_wind_noise and "clipping" in aug:
-                aug = np.random.choice(
-                    self.augmentations,
-                    p=self.weight_augmentations,
-                    size=num_aug,
-                    replace=False,
-                )
 
-        info = get_simu_meta(
-            SimulationConfigs,
-            speech_length,
-            sr,
-            noise_dic=self.noise_source,
-            used_noise_dic=None,
-            wind_noise_dic=self.wind_noises,
-            used_wind_noise_dic=None,
-            use_wind_noise=use_wind_noise,
-            snr_range=(SimulationConfigs.snr_low_bound,
-                       SimulationConfigs.snr_high_bound),
-            wind_noise_snr_range=(SimulationConfigs.wind_noise_config['wind_noise_snr_low_bound'],
-                                  SimulationConfigs.wind_noise_config['wind_noise_snr_high_bound']
-                                  ),
-            store_noise=False,
-            rir_dic=self.rirs,
-            used_rir_dic=None,
-            augmentations=aug,
-            force_1ch=True,
+        clean_dir = self.dns_root / "clean"
+        noisy_dir = self.dns_root / "noisy"
+        assert clean_dir.is_dir(), f"Expected {clean_dir} to exist"
+        assert noisy_dir.is_dir(), f"Expected {noisy_dir} to exist"
+
+        _fileid_re = re.compile(r"fileid_(\d+)", re.IGNORECASE)
+
+        clean_by_id: dict[str, Path] = {}
+        for p in sorted(clean_dir.glob("*.wav")):
+            m = _fileid_re.search(p.stem)
+            if m:
+                clean_by_id[m.group(1)] = p
+
+        noisy_by_id: dict[str, Path] = {}
+        for p in sorted(noisy_dir.glob("*.wav")):
+            m = _fileid_re.search(p.stem)
+            if m:
+                noisy_by_id[m.group(1)] = p
+
+        common_ids = sorted(clean_by_id.keys() & noisy_by_id.keys(), key=lambda x: int(x))
+        assert len(common_ids) > 0, (
+            f"No matching file IDs found between {clean_dir} and {noisy_dir}."
         )
 
-        info['speech_uid'] = speech_uid
-        info['id'] = speech_uid
-        info['snr_dB'] = info['snr']
+        self.clean_files = [clean_by_id[fid] for fid in common_ids]
+        self.noisy_files = [noisy_by_id[fid] for fid in common_ids]
 
-        speech, noisy_speech, fs = process_one_sample(
-            info,
-            store_noise=False,
-            speech_dic=self.speech_source_flt,
-            noise_dic=self.all_noise_flt,
-            rir_dic=self.rirs_flt,
-            highpass=self.use_high_pass,
-            on_the_fly=True,
-            max_duration=self.max_duration,
-
+        print(
+            f"DNSDataset: {len(common_ids)} paired files from {self.dns_root}"
         )
 
-        return speech, noisy_speech, fs
+        print("Pre-scanning audio durations for dynamic batching ...")
+        self.durations: list[int] = []
+        self.sample_index: list[tuple[int, int]] | None = [] if self.use_all_segments else None
+        for file_idx, path in enumerate(tqdm(self.clean_files, desc="Scanning durations", unit="file", leave=False)):
+            info = sf.info(str(path))
+            n_samples = int(info.duration * self.sample_rate)
+            capped_samples = min(n_samples, self.max_clip_samples)
+            if self.use_all_segments and self.segment_samples is not None:
+                num_segments = max(1, capped_samples // self.segment_samples)
+                self.durations.extend([self.segment_samples] * num_segments)
+                assert self.sample_index is not None
+                for segment_idx in range(num_segments):
+                    self.sample_index.append((file_idx, segment_idx))
+            else:
+                self.durations.append(capped_samples)
+        print(
+            f"Duration scan complete. Range: "
+            f"{min(self.durations)/sample_rate:.2f}s – {max(self.durations)/sample_rate:.2f}s"
+        )
+        if self.sample_index is not None:
+            print(
+                f"Deterministic segment mode: {len(self.clean_files)} files -> "
+                f"{len(self.sample_index)} segments of {self.segment_samples / self.sample_rate:.2f}s"
+            )
 
-    def __getitem__(self, index):
+    def __len__(self) -> int:
+        if self.sample_index is not None:
+            return len(self.sample_index)
+        return len(self.clean_files)
 
-        speech_fs, real_idx = self._get_from_index(index)
+    def _load_mono(self, path: Path) -> torch.Tensor:
+        wav_data, sr = sf.read(str(path), always_2d=True)
+        wav = torch.from_numpy(wav_data.T).float()
+        if wav.shape[0] > 1:
+            wav = wav.mean(dim=0, keepdim=True)
+        if sr != self.sample_rate:
+            print(f"Resampling {path} from {sr} Hz to {self.sample_rate} Hz")
+            wav = torchaudio.functional.resample(wav, sr, self.sample_rate)
+        return wav.squeeze(0)
 
-        speech_uid = self.speech_uids[speech_fs][real_idx]
-        speech_path = self.speech_source[speech_fs][speech_uid]
+    def _cap_length(self, clean: torch.Tensor, noisy: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if clean.shape[-1] > self.max_clip_samples:
+            start = random.randint(0, clean.shape[-1] - self.max_clip_samples)
+            return clean[start: start + self.max_clip_samples], noisy[start: start + self.max_clip_samples]
+        return clean, noisy
 
-        # Load speech sample (Channel, Time)
-        if speech_path.endswith(".wav"):
-            with soundfile.SoundFile(speech_path) as af:
-                speech_length = af.frames
+    def _slice_fixed_segment(
+        self,
+        noisy: torch.Tensor,
+        clean: torch.Tensor,
+        segment_idx: int | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.segment_samples is None:
+            return noisy, clean
+
+        aligned_len = min(noisy.shape[-1], clean.shape[-1])
+        noisy = noisy[:aligned_len]
+        clean = clean[:aligned_len]
+        seg_len = self.segment_samples
+
+        if segment_idx is None:
+            start = random.randint(0, aligned_len - seg_len) if aligned_len > seg_len else 0
         else:
-            # Sometimes the acutal loaded audio's length differs from af.frames
-            speech_length = soundfile.read(speech_path)[0].shape[0]
+            start = segment_idx * seg_len
 
-        speech_length = min(self.max_duration, speech_length)
+        end = start + seg_len
+        if end <= aligned_len:
+            return noisy[start:end], clean[start:end]
 
-        if self.retry_when_fails:
-            attempts = 0
+        noisy_seg = torch.zeros(seg_len, dtype=noisy.dtype)
+        clean_seg = torch.zeros(seg_len, dtype=clean.dtype)
+        if start < aligned_len:
+            valid = aligned_len - start
+            noisy_seg[:valid] = noisy[start:aligned_len]
+            clean_seg[:valid] = clean[start:aligned_len]
+        return noisy_seg, clean_seg
 
-            while attempts < 3:
-                try:
-                    speech, noisy_speech, fs = self.run_simulation(
-                        speech_uid, speech_length, speech_fs)
-                    # print(type(speech), speech.shape, type(noisy_speech), noisy_speech.shape)
+    def __getitem__(self, idx: int):
+        mapped_idx = idx
+        segment_idx: int | None = None
+        if self.sample_index is not None:
+            mapped_idx, segment_idx = self.sample_index[idx]
+        try:
+            return self._getitem_inner(mapped_idx, segment_idx)
+        except Exception:
+            fallback = (idx + 1) % len(self)
+            if self.sample_index is not None:
+                mapped_idx, segment_idx = self.sample_index[fallback]
+            else:
+                mapped_idx, segment_idx = fallback, None
+            return self._getitem_inner(mapped_idx, segment_idx)
 
-                    speech, noisy_speech, fs, speech_length = resample_to_fix_fs(speech, noisy_speech, fs, speech_length, self.fix_data_fs)
-                    self.continuous_fail = 0
-                    
-                    return speech, noisy_speech, fs, speech_length
-                except:
-                    attempts += 1
+    def _getitem_inner(self, idx: int, segment_idx: int | None = None):
+        clean = self._load_mono(self.clean_files[idx])
+        noisy = self._load_mono(self.noisy_files[idx])
 
-            # if simulation failed, return clean speech
-            self.continuous_fail += 1
-            speech, fs = soundfile.read(speech_path)
-            speech = np.expand_dims(speech, axis=0)
-            noisy_speech = speech
-            print('Simulation Failed after 3 times try, return clean speech', flush=True)
-
-            if self.continuous_fail > 20:
-                raise RuntimeError("Too many continuous failures in simulation!")
-            # print("speech path:", speech_path, flush=True)
-
-            speech, noisy_speech, fs, speech_length = resample_to_fix_fs(speech, noisy_speech, fs, speech_length, self.fix_data_fs)
-            
-            return speech, noisy_speech, fs, speech_length
-
+        if self.use_all_segments:
+            clean = clean[: self.max_clip_samples]
+            noisy = noisy[: self.max_clip_samples]
+            noisy, clean = self._slice_fixed_segment(noisy, clean, segment_idx)
         else:
-            # print("speech_path:", speech_path, flush=True)
-            speech, noisy_speech, fs = self.run_simulation(
-                speech_uid, speech_length, speech_fs)
-            
-            speech, noisy_speech, fs, speech_length = resample_to_fix_fs(speech, noisy_speech, fs, speech_length, self.fix_data_fs)
+            clean, noisy = self._cap_length(clean, noisy)
 
-            return speech, noisy_speech, fs, speech_length
+        if self.augment:
+            noisy = self.aug(noisy)
+            noisy = noisy.clamp(-1.0, 1.0)
+
+        return noisy, clean
 
 
-class GroupedBatchSampler(BatchSampler):
-    def __init__(self, dataset, batch_size, rank, world_size, seed=0, drop_last=False, bucket_size_mult=100, sampler=None):
-        self.batch_size = batch_size
+class DysarthriaDataset(Dataset):
+    """Paired dysarthria/normal dataset using a JSON manifest.
+
+    Loads the full audio for each pair (no cutting/segmenting).
+    Dysarthria audio is treated as 'noisy' and normal audio as 'clean'.
+    """
+
+    def __init__(
+        self,
+        data_root: str,
+        json_path: str | None = None,
+        sample_rate: int = 16000,
+        max_clip_samples: int = 0,
+        augment: bool = True,
+        split: str = "train",
+        val_ratio: float = 0.05,
+    ):
+        self.data_root = Path(data_root)
+        self.sample_rate = sample_rate
+        self.max_clip_samples = max_clip_samples
+        self.augment = augment
+        self.aug = AudioAugment(sample_rate)
+
+        if json_path is None:
+            json_path = str(self.data_root / "aligned_pairs_used.json")
+
+        with open(json_path, "r") as f:
+            manifest = json.load(f)
+
+        all_pairs = manifest["pairs"]
+
+        # Filter to only pairs where both files exist on disk
+        valid_pairs = []
+        for p in all_pairs:
+            dys_path = self.data_root / Path(p["dysarthria"]).relative_to(Path(p["dysarthria"]).parts[0])
+            norm_path = self.data_root / Path(p["normal"]).relative_to(Path(p["normal"]).parts[0])
+            if dys_path.exists() and norm_path.exists():
+                valid_pairs.append(p)
+
+        # Deterministic split
+        valid_pairs.sort(key=lambda p: p["id"])
+        n_val = max(1, int(len(valid_pairs) * val_ratio))
+        if split == "val":
+            pairs = valid_pairs[:n_val]
+        else:
+            pairs = valid_pairs[n_val:]
+
+        self.dysarthria_files: list[Path] = []
+        self.normal_files: list[Path] = []
+        self.durations: list[int] = []
+
+        for p in pairs:
+            dys_path = self.data_root / Path(p["dysarthria"]).relative_to(Path(p["dysarthria"]).parts[0])
+            norm_path = self.data_root / Path(p["normal"]).relative_to(Path(p["normal"]).parts[0])
+            self.dysarthria_files.append(dys_path)
+            self.normal_files.append(norm_path)
+            dur = p["num_samples"]
+            if self.max_clip_samples > 0:
+                dur = min(dur, self.max_clip_samples)
+            self.durations.append(dur)
+
+        assert len(self.dysarthria_files) > 0, (
+            f"No valid pairs found in {json_path} with data_root={self.data_root}"
+        )
+        print(
+            f"DysarthriaDataset ({split}): {len(self.dysarthria_files)} pairs from {self.data_root}"
+        )
+        print(
+            f"Duration range: "
+            f"{min(self.durations)/sample_rate:.2f}s – {max(self.durations)/sample_rate:.2f}s"
+        )
+
+    def __len__(self) -> int:
+        return len(self.dysarthria_files)
+
+    def _load_mono(self, path: Path) -> torch.Tensor:
+        wav_data, sr = sf.read(str(path), always_2d=True)
+        wav = torch.from_numpy(wav_data.T).float()
+        if wav.shape[0] > 1:
+            wav = wav.mean(dim=0, keepdim=True)
+        if sr != self.sample_rate:
+            wav = torchaudio.functional.resample(wav, sr, self.sample_rate)
+        return wav.squeeze(0)
+
+    def __getitem__(self, idx: int):
+        try:
+            return self._getitem_inner(idx)
+        except Exception:
+            fallback = (idx + 1) % len(self)
+            return self._getitem_inner(fallback)
+
+    def _getitem_inner(self, idx: int):
+        clean = self._load_mono(self.normal_files[idx])
+        noisy = self._load_mono(self.dysarthria_files[idx])
+
+        # Align lengths (take minimum)
+        min_len = min(clean.shape[-1], noisy.shape[-1])
+        clean = clean[:min_len]
+        noisy = noisy[:min_len]
+
+        # Random crop to max_clip_samples
+        if self.max_clip_samples > 0 and min_len > self.max_clip_samples:
+            start = random.randint(0, min_len - self.max_clip_samples)
+            clean = clean[start: start + self.max_clip_samples]
+            noisy = noisy[start: start + self.max_clip_samples]
+
+        if self.augment:
+            noisy = self.aug(noisy)
+            noisy = noisy.clamp(-1.0, 1.0)
+
+        return noisy, clean
+
+
+class DynamicBatchSampler(Sampler):
+    """Form batches so each batch has roughly `max_tokens` audio samples."""
+
+    def __init__(
+        self,
+        durations: list[int],
+        max_tokens: int,
+        max_batch_size: int = 64,
+        shuffle: bool = True,
+        drop_last: bool = True,
+    ):
+        self.durations = durations
+        self.max_tokens = max_tokens
+        self.max_batch_size = max_batch_size
+        self.shuffle = shuffle
         self.drop_last = drop_last
-        self.bucket_size = batch_size * bucket_size_mult  # 桶大小（可调整）
-        self.epoch = 0
-        self.world_size = world_size
-        self.rank = rank
-        self.seed = seed
-        self.generator = torch.Generator().manual_seed(seed + rank + self.epoch)
+        self._cached_batches: list[list[int]] | None = None
+        self._epoch = 0
 
-        # 按采样率分组索引
-        sr_groups = defaultdict(list)
-        for idx, sr in enumerate(dataset.get_srs()):
-            sr_groups[sr].append(idx)
+    def _build_batches(self) -> list[list[int]]:
+        indices = list(range(len(self.durations)))
+        if self.shuffle:
+            indices.sort(key=lambda i: self.durations[i])
+            n_buckets = 20
+            bucket_size = max(1, len(indices) // n_buckets)
+            for start in range(0, len(indices), bucket_size):
+                chunk = indices[start: start + bucket_size]
+                random.shuffle(chunk)
+                indices[start: start + bucket_size] = chunk
+        else:
+            indices.sort(key=lambda i: self.durations[i])
 
-        # 对每个采样率组内的样本按长度排序并分桶
-        self.buckets = []
+        batches: list[list[int]] = []
+        current_batch: list[int] = []
+        current_max_dur = 0
 
-        source_length = dataset.get_source_length()
-        for sr, indices in sr_groups.items():
-            # 按音频长度排序
-            sorted_indices = sorted(indices, key=lambda x: source_length[x])
-            sorted_indices = sorted_indices[self.rank::self.world_size]
+        for idx in indices:
+            dur = self.durations[idx]
+            new_max_dur = max(current_max_dur, dur)
+            new_total = new_max_dur * (len(current_batch) + 1)
+            if len(current_batch) > 0 and (
+                new_total > self.max_tokens or len(current_batch) >= self.max_batch_size
+            ):
+                batches.append(current_batch)
+                current_batch = [idx]
+                current_max_dur = dur
+            else:
+                current_batch.append(idx)
+                current_max_dur = new_max_dur
 
-            # 分桶
-            for i in range(0, len(sorted_indices), self.bucket_size):
-                bucket = sorted_indices[i:i + self.bucket_size]
-                self.buckets.append(bucket)
+        if current_batch and not self.drop_last:
+            batches.append(current_batch)
+        elif current_batch and len(current_batch) > 1:
+            batches.append(current_batch)
 
-    def set_epoch(self, epoch):
-        self.epoch = epoch  # 每次epoch更新时会调用
-        self.generator.manual_seed(self.seed + self.rank + self.epoch)
+        return batches
 
     def __iter__(self):
-        # 打乱桶的顺序以增加随机性
-        random.seed(self.epoch + self.rank)
-        random.shuffle(self.buckets)
-        all_batches = []
-        for bucket in self.buckets:
-            # 打乱桶内样本顺序
-            random.shuffle(bucket)
-            # 生成批次
-            for i in range(0, len(bucket), self.batch_size):
-                batch = bucket[i:i + self.batch_size]
-                if len(batch) < self.batch_size and self.drop_last:
-                    continue
-                all_batches.append(batch)
-        # 打乱所有批次的顺序
-        random.shuffle(all_batches)
-        return iter(all_batches)
-    
-    def state_dict(self):
-        return {'seed': self.seed, 'epoch': self.epoch}
+        batches = self._build_batches()
+        self._cached_batches = batches
+        self._epoch += 1
+        if self.shuffle:
+            random.shuffle(batches)
+        for batch in batches:
+            yield batch
 
-    def __len__(self):
-        total = 0
-        for bucket in self.buckets:
-            num_samples = len(bucket)
-            if self.drop_last:
-                total += num_samples // self.batch_size
-            else:
-                total += (num_samples + self.batch_size - 1) // self.batch_size
-        return total
+    def __len__(self) -> int:
+        if self._cached_batches is not None:
+            return len(self._cached_batches)
+        return len(self._build_batches())
 
 
-def collate_fn(batch):
+def collate_fn(batch: list[tuple[torch.Tensor, torch.Tensor]], sample_rate: int = 16000):
+    """Collate variable-length (noisy, clean) pairs → padded batch tensors + lengths.
+
+    Returns (clean_batch, noisy_batch, fs, lengths) matching the format
+    expected by MeanSE training models:
+      - clean_batch: (B, 1, T_max)
+      - noisy_batch: (B, 1, T_max)
+      - fs: scalar int32 tensor
+      - lengths: (B,) int32 tensor
     """
-    处理不同长度的音频，动态进行右侧补零padding
-    输入格式：batch = [(audio_1, sr_1), (audio_2, sr_2), ...]
-    其中 audio_i 形状为 (1, T_i)
-    """
-    # 分离音频和采样率
-    speechs = [torch.tensor(item[0]) for item in batch]
-    noisy_speechs = [torch.tensor(item[1]) for item in batch]
-    srs = [item[2] for item in batch]
-    lengths = [item[3] for item in batch]
-
-    # 检查批次内采样率一致性（由采样器保证）
-    assert all(sr == srs[0] for sr in srs), "同一批次内采样率不一致"
-    sr = srs[0]
-
-    # 获取最长音频长度
-    # print([audio.shape for audio in speechs], flush=True)
-    max_length = max(audio.shape[1] for audio in speechs)
-
-    # 动态padding并堆叠
-    padded_audios = torch.stack([
-        torch.nn.functional.pad(
-            audio,
-            (0, max_length - audio.shape[1]),  # 右侧补零
-            value=0.0
-        ) for audio in speechs
-    ], dim=0)  # 输出形状：(B, 1, T_max)
-
-    padded_noisy_speech = torch.stack([
-        torch.nn.functional.pad(
-            audio,
-            (0, max_length - audio.size(1)),  # 右侧补零
-            value=0.0
-        ) for audio in noisy_speechs
-    ], dim=0)  # 输出形状：(B, 1, T_max)
-
-    # 返回格式：padded音频张量 + 标量采样率
-    return padded_audios, padded_noisy_speech, torch.tensor(sr, dtype=torch.int32), torch.tensor(lengths, dtype=torch.int32)
+    noisys, cleans = zip(*batch)
+    lengths = torch.tensor([x.shape[-1] for x in cleans], dtype=torch.int32)
+    max_len = max(x.shape[-1] for x in cleans)
+    noisy_batch = torch.stack([F.pad(x, (0, max_len - x.shape[-1])) for x in noisys])
+    clean_batch = torch.stack([F.pad(x, (0, max_len - x.shape[-1])) for x in cleans])
+    # Add channel dimension: (B, T) -> (B, 1, T)
+    clean_batch = clean_batch.unsqueeze(1)
+    noisy_batch = noisy_batch.unsqueeze(1)
+    fs = torch.tensor(sample_rate, dtype=torch.int32)
+    return clean_batch, noisy_batch, fs, lengths
 
 
 class AudioDataModule(lightning.LightningDataModule):
@@ -494,88 +434,93 @@ class AudioDataModule(lightning.LightningDataModule):
         self.valid_dir = config.valid_set_path
         self.num_worker = config.num_worker
         self.batch_size = config.batch_size
-        self.fix_data_fs = getattr(config, "fix_data_fs", None)
+        self.sample_rate = getattr(config, 'fix_data_fs', None) or 16000
+        self.max_duration = getattr(config, 'max_duration', 192000)
 
-        '''
-        print("### AudioDataModule init ###")
-        print("dynamic_mixing:", self.config.train_set_dynamic_mixing, flush=True)
-        print("batch_size:", self.batch_size, flush=True)
-        print("fix_data_fs:", self.fix_data_fs, flush=True)
-        '''
+        dataset_type = getattr(config, 'dataset_type', 'dns')
 
-        if self.config.train_set_dynamic_mixing:
-            self.train_dataset = DynamicMixingDataset(
-                speech_source_scp=f'{self.train_dir}/speech_sources.scp',
-                noise_source_scp=f'{self.train_dir}/noise_scoures.scp',
-                speech_length_file=f'{self.train_dir}/source_length.scp',
-                rir_scp=f'{self.train_dir}/rirs.scp',
-                windnoise_scp=f'{self.train_dir}/wind_noise_scoures.scp',
-                retry_when_fails=True,
-                max_duration=config.max_duration,
-                use_high_pass=config.use_high_pass,
-                fix_data_fs=self.fix_data_fs,
+        if dataset_type == 'dysarthria':
+            dys_json = getattr(config, 'dysarthria_json', None)
+            if dys_json in (None, 'none', ''):
+                dys_json = None
+            val_ratio = getattr(config, 'dysarthria_val_ratio', 0.05)
+            self.train_dataset = DysarthriaDataset(
+                data_root=self.train_dir,
+                json_path=dys_json,
+                sample_rate=self.sample_rate,
+                max_clip_samples=self.max_duration,
+                augment=True,
+                split="train",
+                val_ratio=val_ratio,
+            )
+            self.val_dataset = DysarthriaDataset(
+                data_root=self.train_dir,
+                json_path=dys_json,
+                sample_rate=self.sample_rate,
+                max_clip_samples=self.max_duration,
+                augment=False,
+                split="val",
+                val_ratio=val_ratio,
             )
         else:
-            self.train_dataset = PreSimulatedDataset(
-                clean_speech=f'{self.train_dir}/spk1.scp',
-                noisy_speech=f'{self.train_dir}/wav.scp',
-                utt2fs=f'{self.train_dir}/utt2fs',
-                speech_length=f'{self.train_dir}/speech_length.scp',
-                max_duration=config.max_duration,
-                fix_data_fs=self.fix_data_fs,
+            clip_len = self.max_duration / self.sample_rate
+            segment_len = getattr(config, 'segment_len', None) or None
+            use_all_segments = getattr(config, 'use_all_segments', False)
+
+            self.train_dataset = DNSDataset(
+                dns_root=self.train_dir,
+                sample_rate=self.sample_rate,
+                clip_len=clip_len,
+                segment_len=segment_len,
+                use_all_segments=use_all_segments,
+                augment=True,
             )
 
-        self.val_dataset = PreSimulatedDataset(
-            clean_speech=f'{self.valid_dir}/spk1.scp',
-            noisy_speech=f'{self.valid_dir}/wav.scp',
-            utt2fs=f'{self.valid_dir}/utt2fs',
-            speech_length=f'{self.valid_dir}/speech_length.scp',
-            fix_data_fs=self.fix_data_fs,
-        )
+            self.val_dataset = DNSDataset(
+                dns_root=self.valid_dir,
+                sample_rate=self.sample_rate,
+                clip_len=clip_len,
+                segment_len=segment_len,
+                use_all_segments=use_all_segments,
+                augment=False,
+            )
 
+        self.train_batch_sampler = None
 
-    def on_train_epoch_start(self):
-        """每个epoch开始时更新batch_sampler状态"""
-        if self.train_batch_sampler is not None:
-            self.train_batch_sampler.set_epoch(self.current_epoch)
-
-    
     def train_dataloader(self):
-        rank = torch.distributed.get_rank()
-        world_size = torch.distributed.get_world_size()
-        self.train_batch_sampler = GroupedBatchSampler(
-            self.train_dataset,
-            batch_size=self.batch_size,
-            rank=rank,
-            world_size=world_size,
+        self.train_batch_sampler = DynamicBatchSampler(
+            durations=self.train_dataset.durations,
+            max_tokens=self.max_duration * self.batch_size,
+            max_batch_size=self.batch_size,
+            shuffle=True,
             drop_last=True,
         )
+        _collate = partial(collate_fn, sample_rate=self.sample_rate)
         return DataLoader(
             self.train_dataset,
             batch_sampler=self.train_batch_sampler,
             num_workers=self.num_worker,
             pin_memory=False,
             persistent_workers=True,
-            collate_fn=collate_fn,
+            collate_fn=_collate,
         )
-    
+
     def val_dataloader(self):
-        # rank = torch.distributed.get_rank()
-        # world_size = torch.distributed.get_world_size()
-        self.val_batch_sampler = GroupedBatchSampler(
-            self.val_dataset,
-            batch_size=self.batch_size,
-            rank=0,
-            world_size=1,
+        val_batch_sampler = DynamicBatchSampler(
+            durations=self.val_dataset.durations,
+            max_tokens=self.max_duration * self.batch_size,
+            max_batch_size=self.batch_size,
+            shuffle=False,
             drop_last=True,
         )
+        _collate = partial(collate_fn, sample_rate=self.sample_rate)
         return DataLoader(
             self.val_dataset,
-            batch_sampler=self.val_batch_sampler,
+            batch_sampler=val_batch_sampler,
             num_workers=self.num_worker,
             pin_memory=False,
             persistent_workers=True,
-            collate_fn=collate_fn,
+            collate_fn=_collate,
         )
 
 

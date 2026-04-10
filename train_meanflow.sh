@@ -2,14 +2,11 @@ python meanse/train_meanflow.py \
     --train_tag meanflow \
     --train_name ncsnpp \
     --model_config ./conf/meanflow/ncsnpp.yaml \
-    --flow_ratio 0.5 \
-    --max_interval 1.0 \
-    --batch_size 1 \
+    --train_set_path /home/cmy/cmy/DNS-Challenge/datasets/training_set_10 \
+    --valid_set_path /home/cmy/cmy/DNS-Challenge/datasets/valid_set_10 \
+    --fix_data_fs 16000 \
+    --max_duration 32000 \
+    --batch_size 2 \
     --num_gpu 1 \
     --learning_rate 1e-5 \
-    --weight_decay 1e-6 \
-    --train_set_path ./DATA/vctk/train_noisy_16k \
-    --valid_set_path ./DATA/vctk/valid_noisy_16k \
-    --fix_data_fs 16000 \
-    --max_duration 40000 \
-    --val_check_interval 1000
+    --val_check_interval 5000

@@ -48,11 +48,16 @@ def config_parser():
         sigma_max=0.5,
         sigma_min=0.05,
         ema_decay=0.999,
-        t_eps=0.0,
+        t_eps=1e-5,
         T_rev=1.0,
         loss_type='adaptive_l2',
         loss_abs_exponent=0.5,
         fix_data_fs=0,
+        segment_len=0.0,
+        use_all_segments=False,
+        dataset_type='dns',
+        dysarthria_json='none',
+        dysarthria_val_ratio=0.05,
     )
 
     parameters = vars(cfg)
@@ -98,6 +103,7 @@ def prepare_call_backs(cfg):
 if __name__ == "__main__":
     mp.set_start_method('spawn')
     torch.set_float32_matmul_precision('medium')
+    torch.serialization.add_safe_globals([Config])
     args = config_parser()
     cfg = Config(**vars(args))
     print(cfg)
@@ -138,6 +144,7 @@ if __name__ == "__main__":
         print(f"Init param loaded from {cfg.init_from}")
 
     logger = TensorBoardLogger(save_dir=f"./exp/{cfg.train_tag}", version=cfg.train_version, name=cfg.train_name)
+
     call_backs = prepare_call_backs(cfg=cfg)
 
     last_ckpt = f"./exp/{cfg.train_tag}/{cfg.train_name}/version_{cfg.train_version}/checkpoints/last.ckpt"
@@ -153,6 +160,8 @@ if __name__ == "__main__":
         val_check_interval=cfg.val_check_interval,
         callbacks=call_backs,
         strategy='ddp_find_unused_parameters_true',
+        use_distributed_sampler=False,
+        precision='32-true',
     )
 
     trainer.fit(model=model, datamodule=AudioDataModule(config=cfg), ckpt_path=last_ckpt)

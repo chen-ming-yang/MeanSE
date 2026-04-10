@@ -9,6 +9,7 @@ from torch_ema import ExponentialMovingAverage
 from meanse.odes import FLOWMATCHING
 from espnet2.enh.encoder.stft_encoder import STFTEncoder
 from espnet2.enh.decoder.stft_decoder import STFTDecoder
+from meanse.codec_vae import build_codec_vae
 from functools import partial
 import numpy as np
 from meanutils.myutils import read_yaml
@@ -48,8 +49,17 @@ class MeanFlowSEModel(L.LightningModule):
         self.save_hyperparameters()
         self.cfg = cfg
         self.ode = FLOWMATCHING(**model_cfg.get("ode_config", {}))
-        self.encoder = STFTEncoder(**model_cfg.get("encoder_config", {}))
-        self.decoder = STFTDecoder(**model_cfg.get("decoder_config", {}))
+
+        self.codec_type = model_cfg.get("codec_type", "stft")
+        if self.codec_type == "dac":
+            dac_cfg = model_cfg.get("dac_config", {})
+            self.encoder, self.decoder = build_codec_vae(
+                model_name=dac_cfg.get("model_name", "dac_16khz"),
+                sr=dac_cfg.get("sr", 16000),
+            )
+        else:
+            self.encoder = STFTEncoder(**model_cfg.get("encoder_config", {}))
+            self.decoder = STFTDecoder(**model_cfg.get("decoder_config", {}))
         
         if model_name == "ncsnpp":
             self.dnn = NCSNpp(**model_cfg.get("model_config", {}))
@@ -91,7 +101,7 @@ class MeanFlowSEModel(L.LightningModule):
             if p.grad is not None
         )
         if grad_has_nan:
-            rank = torch.distributed.get_rank()
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
             print(f'RANK {rank}: NaN in grad has been decected, reset grad to zero')
             optimizer.zero_grad()
             
@@ -150,15 +160,26 @@ class MeanFlowSEModel(L.LightningModule):
         return loss
     
     def speech_to_feature(self, speech, fs, speech_length):
-
-        feature, f_lens = self.encoder(speech, speech_length, fs=fs) # B, T, F
+        if self.codec_type == "dac":
+            feature = self.encoder(speech)  # B, T_latent, latent_dim
+            # Split real latent into real+imag halves to form complex tensor
+            # so NCSNpp can use .real/.imag as expected
+            D = feature.shape[-1] // 2
+            feature = torch.complex(feature[..., :D], feature[..., D:])
+        else:
+            feature, f_lens = self.encoder(speech, speech_length, fs=fs) # B, T, F
         feature = feature.permute(0, 2, 1).unsqueeze(1)
         return feature
     
     def feature_to_speech(self, feature, fs, speech_length):
-        
         feature = feature.squeeze(1).permute(0, 2, 1)
-        speech, _=  self.decoder(feature, speech_length, fs)
+        if self.codec_type == "dac":
+            # Reconstruct real latent from complex tensor
+            feature = torch.cat([feature.real, feature.imag], dim=-1)
+            print(f"decoder input shape: {feature.shape}", flush=True)
+            speech = self.decoder(feature)  # B, T
+        else:
+            speech, _ = self.decoder(feature, speech_length, fs)
         return speech
     
     def on_train_start(self):
@@ -201,11 +222,17 @@ class MeanFlowSEModel(L.LightningModule):
             (v_hat, torch.zeros_like(r), torch.ones_like(t)),
         )
         
+        # Disable gradient checkpointing during JVP (incompatible with forward-mode AD)
+        _ckpt_backup = getattr(self.dnn, 'use_checkpoint', False)
+        self.dnn.use_checkpoint = False
+        
         # with torch.backends.cudnn.flags(enabled=False):
         if self.create_graph:
             u, dudt = self.jvp_fn(*jvp_args, create_graph=True)
         else:
             u, dudt = self.jvp_fn(*jvp_args)
+        
+        self.dnn.use_checkpoint = _ckpt_backup
             
         u_tgt = v_hat - (t_ - r_) * dudt
         err = u - u_tgt.detach() # B, 1, F, T, complex

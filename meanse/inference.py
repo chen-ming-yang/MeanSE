@@ -2,11 +2,15 @@ import warnings
 warnings.filterwarnings("ignore", category=UserWarning, message=".*pkg_resources.*")
 import soundfile as sf
 import torch
+import torchaudio
 from tqdm import tqdm
 from meanse.flow_model import FlowSEModel
 from meanse.meanflow_model import MeanFlowSEModel
+from meanse.config import Config
 import os
 import tqdm
+
+torch.serialization.add_safe_globals([Config])
 
 def main(args):
     force_model_type = args.force_model_type.lower()
@@ -29,11 +33,24 @@ def main(args):
 
     model.eval()
 
+    # Get the model's expected sample rate
+    model_sr = getattr(model.cfg, 'fix_data_fs', 0)
+    if model_sr == 0:
+        model_sr = 16000
+    print(f"Model expected sample rate: {model_sr}")
+
+    # Support single wav file or scp file
     input_audios = {}
-    with open(args.input_scp) as f:
-        for line in f:
-            utt, wav = line.strip().split()
-            input_audios[utt] = wav
+    if args.input_wav:
+        uid = os.path.splitext(os.path.basename(args.input_wav))[0]
+        input_audios[uid] = args.input_wav
+    elif args.input_scp:
+        with open(args.input_scp) as f:
+            for line in f:
+                utt, wav = line.strip().split()
+                input_audios[utt] = wav
+    else:
+        raise ValueError("Please provide --input_wav or --input_scp")
 
     os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(args.output_dir + "/wav", exist_ok=True)
@@ -44,6 +61,13 @@ def main(args):
             wav_path = input_audios[uid]
             wav, sr = sf.read(wav_path)
             wav = torch.tensor(wav).float().to(device).view(1, -1)
+
+            # Resample to model's expected sample rate if needed
+            if sr != model_sr:
+                print(f"Resampling {uid} from {sr} Hz to {model_sr} Hz")
+                wav = torchaudio.functional.resample(wav, sr, model_sr)
+                sr = model_sr
+
             length = torch.tensor(wav.shape[-1]).to(device).view(1)
 
             with torch.no_grad():
@@ -60,10 +84,18 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
     parser.add_argument(
+        "--input_wav",
+        type=str,
+        required=False,
+        default=None,
+        help="Path to a single noisy wav file",
+    )
+    parser.add_argument(
         "--input_scp",
         type=str,
-        required=True,
-        help="Path to the tsv file containing audio samples",
+        required=False,
+        default=None,
+        help="Path to the scp file containing audio samples",
     )
     parser.add_argument(
         "--output_dir",

@@ -1,0 +1,17 @@
+model_name: ncsnpp
+codec_type: dac
+
+model_config:
+  flow_type: mean
+  fuse_type: linear
+  image_size: 512
+  conditional: True
+  use_checkpoint: True
+
+ode_config:
+  sigma_min: 0
+  sigma_max: 0.5
+
+dac_config:
+  model_name: dac_16khz
+  sr: 16000
