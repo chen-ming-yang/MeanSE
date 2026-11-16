@@ -4,11 +4,13 @@ python meanse/train_meanflow.py \
     --train_tag meanflow \
     --train_name ncsnpp \
     --model_config ./conf/meanflow/ncsnpp.yaml \
-    --train_set_path /home/cmy/cmy/DNS-Challenge/datasets/training_set_10 \
-    --valid_set_path /home/cmy/cmy/DNS-Challenge/datasets/valid_set_10 \
+    --train_set_path /cmy/cmy/enhance/training_set_10 \
+    --valid_set_path /cmy/cmy/enhance/valid_set_10 \
     --fix_data_fs 16000 \
     --max_duration 32000 \
-    --batch_size 2 \
+    --segment_len 2.0 \
+    --use_all_segments True \
+    --batch_size 4 \
     --num_gpu 1 \
     --learning_rate 1e-4 \
     --val_check_interval 5000
@@ -30,15 +32,15 @@ python meanse/train_meanflow.py \
 
 
 python meanse/inference.py \
-    --input_wav /home/cmy/cmy/DNS-Challenge/datasets/dns/datasets.dev_testset/datasets/dev_testset/ms_realrec_emotional_laptopmicrophone_A3U20M3KJ10B1A_Creakingchair_near_Surprised_fileid_5.wav \
-    --ckpt_path /home/cmy/cmy/MeanSE/exp/meanflow/ncsnpp/version_0/checkpoints/best_epoch=00-step=005000-val_loss=0.355.ckpt \
+    --input_wav /cmy/cmy/enhance/valid_set_10/noisy/1011_ITH_ANG_XX-book_09393_chp_0017_reader_06919_24_jaYTIEsz5tU_snr11_tl-33_fileid_118513.wav \
+    --ckpt_path /cmy/cmy/MeanSE/exp/meanflow/ncsnpp/version_0/checkpoints/best_epoch=02-step=105000-val_loss=0.142.ckpt \
     --output_dir ./inference_output \
     --force_model_type meanflow
 
 
 python meanse/inference.py \
-    --input_wav /home/cmy/MeanFlowSE/after_catting/1h/Audio/01/S001T001E000N00001.wav \
-    --ckpt_path /home/cmy/cmy/MeanSE/exp/meanflow/ncsnpp_dysar/version_0/checkpoints/best_epoch=00-step=005000-val_loss=0.432.ckpt \
+    --input_wav /cmy/after_catting/1h/Audio/01/S001T001E000N00001.wav \
+    --ckpt_path /cmy/cmy/MeanSE/exp/meanflow/ncsnpp_dysar/version_0/checkpoints/best_epoch=07-step=070000-val_loss=0.388.ckpt \
     --output_dir ./inference_output \
     --force_model_type meanflow
 
@@ -48,4 +50,11 @@ python meanse/inference.py \
 
 ossutil cp /home/cmy/cmy/MeanSE/inference.sh oss://jn-ranyan
 
-python meanse/train_meanflow.py     --train_tag meanflow     --train_name ncsnpp_dysar     --model_config ./conf/meanflow/ncsnpp.yaml     --train_set_path /home/cmy/MeanFlowSE/tmp_audio_equal_len     --valid_set_path /home/cmy/MeanFlowSE/tmp_audio_equal_len     --dataset_type dysarthria     --fix_data_fs 16000     --max_duration 32000     --batch_size 2     --num_gpu 1     --learning_rate 1e-4     --val_check_interval 5000
+python meanse/train_meanflow.py     --train_tag meanflow     --train_name ncsnpp_dysar     --model_config ./conf/meanflow/ncsnpp.yaml     --train_set_path /cmy/cmy/tmp_audio_equal_len     --valid_set_path /cmy/cmy/tmp_audio_equal_len     --dataset_type dysarthria     --fix_data_fs 16000     --max_duration 32000     --batch_size 2     --num_gpu 1     --learning_rate 1e-4     --val_check_interval 5000
+
+1. 10h数据清理
+2. 最新数据处理
+3. funasr 10h 数据强化
+4. 强化后的模型来增强新的数据集的翻译效果
+5. 生成正常噪音数据对
+

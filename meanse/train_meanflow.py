@@ -58,6 +58,7 @@ def config_parser():
         dataset_type='dns',
         dysarthria_json='none',
         dysarthria_val_ratio=0.05,
+        keep_full_length=False,
     )
 
     parameters = vars(cfg)

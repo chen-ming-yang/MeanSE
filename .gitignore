@@ -3,3 +3,6 @@ logs/
 inference/
 *egg-info*
 *pycache*
+# local scratch
+wget-log
+inference_output/

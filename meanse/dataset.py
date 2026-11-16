@@ -235,11 +235,13 @@ class DysarthriaDataset(Dataset):
         augment: bool = True,
         split: str = "train",
         val_ratio: float = 0.05,
+        keep_full_length: bool = False,
     ):
         self.data_root = Path(data_root)
         self.sample_rate = sample_rate
         self.max_clip_samples = max_clip_samples
         self.augment = augment
+        self.keep_full_length = keep_full_length
         self.aug = AudioAugment(sample_rate)
 
         if json_path is None:
@@ -276,7 +278,7 @@ class DysarthriaDataset(Dataset):
             self.dysarthria_files.append(dys_path)
             self.normal_files.append(norm_path)
             dur = p["num_samples"]
-            if self.max_clip_samples > 0:
+            if self.max_clip_samples > 0 and not self.keep_full_length:
                 dur = min(dur, self.max_clip_samples)
             self.durations.append(dur)
 
@@ -320,7 +322,7 @@ class DysarthriaDataset(Dataset):
         noisy = noisy[:min_len]
 
         # Random crop to max_clip_samples
-        if self.max_clip_samples > 0 and min_len > self.max_clip_samples:
+        if not self.keep_full_length and self.max_clip_samples > 0 and min_len > self.max_clip_samples:
             start = random.randint(0, min_len - self.max_clip_samples)
             clean = clean[start: start + self.max_clip_samples]
             noisy = noisy[start: start + self.max_clip_samples]
@@ -440,6 +442,7 @@ class AudioDataModule(lightning.LightningDataModule):
         dataset_type = getattr(config, 'dataset_type', 'dns')
 
         if dataset_type == 'dysarthria':
+            keep_full = getattr(config, 'keep_full_length', False)
             dys_json = getattr(config, 'dysarthria_json', None)
             if dys_json in (None, 'none', ''):
                 dys_json = None
@@ -452,6 +455,7 @@ class AudioDataModule(lightning.LightningDataModule):
                 augment=True,
                 split="train",
                 val_ratio=val_ratio,
+                keep_full_length=keep_full,
             )
             self.val_dataset = DysarthriaDataset(
                 data_root=self.train_dir,
@@ -461,6 +465,7 @@ class AudioDataModule(lightning.LightningDataModule):
                 augment=False,
                 split="val",
                 val_ratio=val_ratio,
+                keep_full_length=keep_full,
             )
         else:
             clip_len = self.max_duration / self.sample_rate

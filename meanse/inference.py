@@ -12,21 +12,38 @@ import tqdm
 
 torch.serialization.add_safe_globals([Config])
 
+def _load_ckpt(model_cls, ckpt_path, device, strict):
+    # PyTorch 2.6 defaults torch.load(weights_only=True), which breaks full PL checkpoints.
+    try:
+        return model_cls.load_from_checkpoint(
+            ckpt_path,
+            map_location=device,
+            strict=strict,
+            weights_only=False,
+        )
+    except TypeError:
+        # Older Lightning versions may not accept weights_only.
+        return model_cls.load_from_checkpoint(
+            ckpt_path,
+            map_location=device,
+            strict=strict,
+        )
+
 def main(args):
     force_model_type = args.force_model_type.lower()
     device = args.device
 
     if force_model_type == "flow":
-        model = FlowSEModel.load_from_checkpoint(args.ckpt_path, map_location=device, strict=False)
+        model = _load_ckpt(FlowSEModel, args.ckpt_path, device, strict=False)
     elif force_model_type == "meanflow":
-        model = MeanFlowSEModel.load_from_checkpoint(args.ckpt_path, map_location=device, strict=False)
+        model = _load_ckpt(MeanFlowSEModel, args.ckpt_path, device, strict=False)
     else:
         try:
-            model = MeanFlowSEModel.load_from_checkpoint(args.ckpt_path, map_location=device, strict=True)
+            model = _load_ckpt(MeanFlowSEModel, args.ckpt_path, device, strict=True)
             print("Load MeanFlowSEModel successfully!")
         except:
             try:
-                model = FlowSEModel.load_from_checkpoint(args.ckpt_path, map_location=device, strict=True)
+                model = _load_ckpt(FlowSEModel, args.ckpt_path, device, strict=True)
                 print("Load FlowSEModel successfully!")
             except:
                 raise RuntimeError("Failed to load the model, please check the checkpoint path, or set --force_model_type to 'flow' or 'meanflow'!")
