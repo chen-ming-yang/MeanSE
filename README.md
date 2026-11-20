@@ -46,3 +46,11 @@ We have provided inference bash script examples in `meanse/inference.sh`. Some k
 
 ---
 *MeanSE is developed based on the open-source code framework provided by [Urgent 2026 Challenge](https://github.com/urgent-challenge/urgent2026_challenge_track1)*
+---
+
+## License
+
+This project is released under the **Apache License 2.0**. See [LICENSE](LICENSE).
+
+It contains code derived from the Google Research Authors (Apache-2.0) and builds on
+ESPnet (Apache-2.0). See [NOTICE](NOTICE) for details.

@@ -1,0 +1,19 @@
+MeanSE
+Copyright 2025-2026 chen-ming-yang
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+It includes or builds upon the following third-party software:
+
+1. Google Research Authors — meanse/ncsnpp.py
+   Derived from the DDPM / score_sde code base.
+   Licensed under the Apache License, Version 2.0.
+
+2. ESPnet — https://github.com/espnet/espnet
+   Licensed under the Apache License, Version 2.0.
+
+3. Urgent 2026 Challenge framework — https://github.com/urgent-challenge/urgent2026_challenge_track1
+   MeanSE is developed on top of this framework. Please refer to the upstream
+   repository for its license terms before redistribution.
+
+All third-party components remain under their original licenses.
